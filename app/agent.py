@@ -6,27 +6,24 @@
 #
 # Runs inside Docker, so it connects to Ollama on the host machine
 # via "host.docker.internal" rather than "localhost".
+#
+# The final answer is built deterministically in Python from the raw
+# tool outputs, rather than trusting the local 8B model to restate
+# SMILES strings/numbers accurately — it has been observed to
+# paraphrase tool results incorrectly (e.g. inventing a wrong SMILES).
+# The LLM is only used to decide which tool(s) to call.
 # ------------------------------------------------------------------
 
 import httpx
 import json
-
 from ollama import Client
+
 from app.model import predict as predict_toxicity
 
 OLLAMA_MODEL = "llama3.1:8b"
 OLLAMA_HOST = "http://host.docker.internal:11434"
 
-client = Client(host=OLLAMA_HOST)
-
-SYSTEM_PROMPT = (
-    "You are a toxicology assistant. For any question about a specific "
-    "molecule's toxicity or FDA approval likelihood, you MUST use the "
-    "available tools (looking up the SMILES via PubChem if needed, then "
-    "calling the prediction tool) rather than relying on your own general "
-    "medical knowledge. Do not invent dosage calculators, code, or medical "
-    "advice that isn't grounded in the tool results."
-)
+ollama_client = Client(host=OLLAMA_HOST)
 
 
 def lookup_pubchem_by_name(compound_name: str) -> dict:
@@ -43,15 +40,18 @@ def lookup_pubchem_by_name(compound_name: str) -> dict:
         cid_response.raise_for_status()
         cid = cid_response.json()["IdentifierList"]["CID"][0]
 
+        # PubChem has renamed CanonicalSMILES to ConnectivitySMILES in
+        # some API responses; request both and accept whichever is present.
         smiles_url = (
             f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/"
-            f"{cid}/property/CanonicalSMILES/JSON"
+            f"{cid}/property/ConnectivitySMILES,CanonicalSMILES/JSON"
         )
         smiles_response = httpx.get(smiles_url, timeout=10)
         smiles_response.raise_for_status()
-        smiles = smiles_response.json()["PropertyTable"]["Properties"][0]["CanonicalSMILES"]
+        properties = smiles_response.json()["PropertyTable"]["Properties"][0]
+        smiles = properties.get("CanonicalSMILES") or properties.get("ConnectivitySMILES")
 
-        return {"compound_name": compound_name, "smiles": smiles, "found": True}
+        return {"compound_name": compound_name, "smiles": smiles, "found": smiles is not None}
     except Exception:
         return {"compound_name": compound_name, "smiles": None, "found": False}
 
@@ -100,46 +100,79 @@ AVAILABLE_FUNCTIONS = {
     "predict_toxicity_tool": predict_toxicity_tool,
 }
 
+SYSTEM_PROMPT = """You are a molecular toxicity assistant. You have access to two tools:
+1. lookup_pubchem_by_name - looks up a compound's SMILES string from PubChem
+2. predict_toxicity_tool - predicts FDA approval and clinical toxicity probability for a SMILES string
+
+When the user asks about a compound by name, call lookup_pubchem_by_name first
+to get its SMILES, then call predict_toxicity_tool with that exact SMILES.
+"""
+
 
 def ask_agent(question: str) -> str:
     """
     Send a natural-language question to the local Ollama model, let
-    it call tools as needed (PubChem lookup, toxicity prediction),
-    and return a final natural-language answer.
+    it decide which tool(s) to call, execute those tools, and return
+    a deterministic answer built directly from the real tool outputs
+    (not from the model's own restatement of them).
     """
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": question},
     ]
 
-    response = client.chat(model=OLLAMA_MODEL, messages=messages, tools=TOOLS)
-
+    response = ollama_client.chat(model=OLLAMA_MODEL, messages=messages, tools=TOOLS)
     message = response.message if hasattr(response, "message") else response["message"]
     tool_calls = getattr(message, "tool_calls", None) or message.get("tool_calls")
 
-    messages.append({
-        "role": "assistant",
-        "content": getattr(message, "content", None) or message.get("content", ""),
-    })
+    if not tool_calls:
+        return getattr(message, "content", None) or message.get("content", "")
 
-    if tool_calls:
-        for tool_call in tool_calls:
-            func = tool_call.function if hasattr(tool_call, "function") else tool_call["function"]
-            func_name = getattr(func, "name", None) or func["name"]
-            func_args = getattr(func, "arguments", None) or func["arguments"]
+    # Execute tools and keep the real results in Python, not trusting
+    # the model to repeat them verbatim later.
+    tool_results = []
+    for tool_call in tool_calls:
+        func = tool_call.function if hasattr(tool_call, "function") else tool_call["function"]
+        func_name = getattr(func, "name", None) or func["name"]
+        func_args = getattr(func, "arguments", None) or func["arguments"]
 
-            if func_name in AVAILABLE_FUNCTIONS:
-                result = AVAILABLE_FUNCTIONS[func_name](**func_args)
+        if func_name in AVAILABLE_FUNCTIONS:
+            result = AVAILABLE_FUNCTIONS[func_name](**func_args)
+        else:
+            result = {"error": f"Unknown tool: {func_name}"}
+
+        tool_results.append((func_name, func_args, result))
+
+    # If a name lookup succeeded but toxicity wasn't predicted yet
+    # (small models sometimes only call one tool per turn), chain the
+    # second call ourselves using the real SMILES we just retrieved.
+    has_lookup = any(name == "lookup_pubchem_by_name" for name, _, _ in tool_results)
+    has_prediction = any(name == "predict_toxicity_tool" for name, _, _ in tool_results)
+
+    if has_lookup and not has_prediction:
+        for name, _, result in tool_results:
+            if name == "lookup_pubchem_by_name" and result.get("found"):
+                pred_result = predict_toxicity_tool(result["smiles"])
+                tool_results.append(("predict_toxicity_tool", {"smiles": result["smiles"]}, pred_result))
+                break
+
+    # Build a deterministic, guaranteed-accurate summary directly from
+    # the real tool outputs — no LLM paraphrasing of numbers/SMILES.
+    lines = []
+    for func_name, func_args, result in tool_results:
+        if func_name == "lookup_pubchem_by_name":
+            if result.get("found"):
+                lines.append(f"**{result['compound_name']}** → SMILES: `{result['smiles']}`")
             else:
-                result = {"error": f"Unknown tool: {func_name}"}
+                lines.append(f"Could not find '{func_args.get('compound_name')}' on PubChem.")
+        elif func_name == "predict_toxicity_tool":
+            if "error" in result:
+                lines.append(f"Prediction error: {result['error']}")
+            else:
+                lines.append(
+                    f"- FDA approval probability: **{result['fda_approved_prob']:.1%}**\n"
+                    f"- Clinical toxicity probability: **{result['ct_tox_prob']:.1%}**\n"
+                    f"- Aromatic amine structural alert: **{'Yes' if result['aromatic_amine_alert'] else 'No'}**"
+                )
 
-            messages.append({
-                "role": "tool",
-                "content": json.dumps(result),
-            })
-
-        final_response = client.chat(model=OLLAMA_MODEL, messages=messages)
-        final_message = final_response.message if hasattr(final_response, "message") else final_response["message"]
-        return getattr(final_message, "content", None) or final_message.get("content", "")
-
-    return getattr(message, "content", None) or message.get("content", "")
+    return "\n\n".join(lines)
