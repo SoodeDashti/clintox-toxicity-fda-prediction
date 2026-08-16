@@ -8,6 +8,7 @@ This is my second full ML portfolio project, after an earlier [diabetes risk pre
 
 1. **A bioinformatics/clinical framing, not just a classifier.** Every step — from how molecules are cleaned, to how the train/test split is designed, to what the SHAP results mean — is interpreted the way a medicinal chemist or biologist would, not just reported as a metric.
 2. **A local LLM agent with tool-calling**, layered on top of the same FastAPI service. Ask it a question in plain language ("Is ibuprofen likely to be toxic?") and it looks up the molecule via PubChem, runs it through the trained model, and answers — using the project's own model, not generic LLM knowledge.
+![Dashboard with LLM agent answering a question grounded in the trained model](analysis/dashboard_agent_demo.png)
 
 ## Table of Contents
 
